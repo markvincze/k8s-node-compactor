@@ -58,38 +58,63 @@ func main() {
 			}
 		}
 
-		fmt.Printf("Pods on the node %v\n", *node.Metadata.Name)
+		fmt.Printf("Node %v\n", *node.Metadata.Name)
+		allocatableCpu := cpuReqStrToCpu(*node.Status.Allocatable["cpu"].String_)
+		allocatableMemory := memoryReqStrToMemory(*node.Status.Allocatable["memory"].String_)
+		fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", allocatableCpu, allocatableMemory)
+		// fmt.Printf("Pods on the node %v\n", *node.Metadata.Name)
+		// fmt.Printf("Allocatable resources: %v\n", node.Status.Allocatable)
+		podsTotalCpuReq := 0
+		podsTotalMemoryReq := 0
+
 		for _, pod := range pods {
 			cpuReq := 0
 			memoryReq := 0
 			for _, container := range pod.Spec.Containers {
 				if container.Resources.Requests["cpu"] != nil {
 					cpuReqStr := *container.Resources.Requests["cpu"].String_
-					cpuReqStr = cpuReqStr[:len(cpuReqStr)-1] // 1500m
-					containerCpuReq, _ := strconv.Atoi(cpuReqStr)
-					cpuReq += containerCpuReq
+					cpuReq += cpuReqStrToCpu(cpuReqStr)
 				}
 
 				if container.Resources.Requests["memory"] != nil {
 					memoryReqStr := *container.Resources.Requests["memory"].String_
-					memoryReqStr = memoryReqStr[:len(memoryReqStr)-2] // 1500Mi
-					containerMemoryReq, _ := strconv.Atoi(memoryReqStr)
-					memoryReq += containerMemoryReq
+					memoryReq += memoryReqStrToMemory(memoryReqStr)
 				}
 			}
 
-			fmt.Printf(
-				"\t%v (%v), total CPU request: %vm, total memory request: %vMi\n",
-				*pod.Metadata.Name,
-				*pod.Metadata.Namespace,
-				cpuReq,
-				memoryReq)
+			podsTotalCpuReq += cpuReq
+			podsTotalMemoryReq += memoryReq
+
+			// fmt.Printf(
+			// 	"\t%v (%v), total CPU request: %vm, total memory request: %vMi\n",
+			// 	*pod.Metadata.Name,
+			// 	*pod.Metadata.Namespace,
+			// 	cpuReq,
+			// 	memoryReq)
 		}
 
-		fmt.Printf("Allocatable resources: %v", node.Status.Allocatable)
+		fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", podsTotalCpuReq, podsTotalMemoryReq)
 	}
 
 	// fmt.Printf("%v\n", pod.Spec)
+}
+
+func memoryReqStrToMemory(str string) int {
+	str = str[:len(str)-2] // For example: 2000Mi
+	memory, _ := strconv.Atoi(str)
+	return memory
+}
+
+func cpuReqStrToCpu(str string) int {
+	if str[len(str)-1:] == "m" {
+		str = str[:len(str)-1] // For example: 1500m
+		cpu, _ := strconv.Atoi(str)
+		return cpu
+	} else {
+		coreCount, _ := strconv.Atoi(str) // For example: 3
+
+		return coreCount * 1000
+	}
 }
 
 // loadClient parses a kubeconfig from a file and returns a Kubernetes

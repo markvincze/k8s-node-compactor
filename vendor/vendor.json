@@ -75,6 +75,12 @@
 			"versionExact": "v1.2.0"
 		},
 		{
+			"checksumSHA1": "/NB9AGM1V8sJpHoVtRc47O5F9CQ=",
+			"path": "github.com/ghodss/yaml",
+			"revision": "25d852aebe32c875e9c044af3eef9c7dc6bc777f",
+			"revisionTime": "2019-02-12T21:16:48Z"
+		},
+		{
 			"checksumSHA1": "Wp97rIwFg54dNwuCeR9Vslaehtw=",
 			"path": "github.com/golang/protobuf/proto",
 			"revision": "b85cd75de734650db18a99a943fe351d41387800",
@@ -127,7 +133,13 @@
 			"path": "golang.org/x/text/unicode/norm",
 			"revision": "5d731a35f4867878fc89f7744f7b6debb3beded6",
 			"revisionTime": "2019-03-06T14:45:11Z"
+		},
+		{
+			"checksumSHA1": "oNqPrS2edE8peI3ah2INe379k8E=",
+			"path": "gopkg.in/yaml.v2",
+			"revision": "51d6538a90f86fe93ac480b35f37b2be17fef232",
+			"revisionTime": "2018-11-15T11:05:04Z"
 		}
 	],
-	"rootPath": "github.com/estafette/estafette-k8s-node-compactor"
+	"rootPath": "github.com/markvincze/k8s-node-compactor"
 }
