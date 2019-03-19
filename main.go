@@ -12,6 +12,13 @@ import (
 	"github.com/ghodss/yaml"
 )
 
+// For every node, we check
+// 1. Total use of allocated resources is below limit
+// 2. There are enough other nodes also under the limit
+// 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
+
+const annotationDesiredMinCpuUsage = "estafette.io/compactor-desired-min-cpu-usage"
+
 func main() {
 	// client, err := k8s.NewInClusterClient()
 
@@ -21,6 +28,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	var pod corev1.Pod
+	if err = client.Get(context.Background(), "staging", "shoppingcart-cb7c89fbf-qxdz9", &pod); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := client.Create(context.Background(), &pod, k8s.Subresource("eviction")); err != nil {
+		log.Fatal(err)
+	}
+
+	return
 	var nodes corev1.NodeList
 	if err := client.List(context.Background(), k8s.AllNamespaces, &nodes); err != nil {
 		log.Fatal(err)
@@ -44,6 +61,11 @@ func main() {
 
 	// return
 
+	// For every node, we check
+	// 1. Total use of allocated resources is below limit
+	// 2. There are enough other nodes also under the limit
+	// 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
+
 	for _, node := range nodes.Items {
 		var pods []*corev1.Pod
 		for _, pod := range allPods.Items {
@@ -52,11 +74,13 @@ func main() {
 			}
 		}
 
+		// fmt.Printf("Node metadata %v\n", *node.Metadata)
+		fmt.Printf("Node pool: %v\n", node.Metadata.Labels["cloud.google.com/gke-nodepool"])
 		fmt.Printf("Node %v\n", *node.Metadata.Name)
 		allocatableCPU := cpuReqStrToCPU(*node.Status.Allocatable["cpu"].String_)
 		allocatableMemory := memoryReqStrToMemoryMB(*node.Status.Allocatable["memory"].String_)
 		fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", allocatableCPU, allocatableMemory)
-		fmt.Printf("Node status: %v\n", node.Metadata)
+		// fmt.Printf("Node status: %v\n", node.Metadata)
 
 		podsTotalCPUReq := 0
 		podsTotalMemoryReq := 0
