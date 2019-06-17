@@ -28,16 +28,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	var pod corev1.Pod
-	if err = client.Get(context.Background(), "staging", "shoppingcart-cb7c89fbf-qxdz9", &pod); err != nil {
-		log.Fatal(err)
-	}
+	// var pod corev1.Pod
+	// if err = client.Get(context.Background(), "staging", "shoppingcart-cb7c89fbf-qxdz9", &pod); err != nil {
+	// 	log.Fatal(err)
+	// }
 
-	if err := client.Create(context.Background(), &pod, k8s.Subresource("eviction")); err != nil {
-		log.Fatal(err)
-	}
+	// if err := client.Create(context.Background(), &pod, k8s.Subresource("eviction")); err != nil {
+	// 	log.Fatal(err)
+	// }
 
-	return
+	// return
 	var nodes corev1.NodeList
 	if err := client.List(context.Background(), k8s.AllNamespaces, &nodes); err != nil {
 		log.Fatal(err)
