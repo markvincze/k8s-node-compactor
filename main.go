@@ -1,3 +1,12 @@
+// - Don't delete young node
+// - For deleting a node, I need a GCP service account, example in the preemptible killer
+// - Use node labels for opt-in and limits
+
+// Labels:
+// - ScaleDownCpuRequestPercentageLimit
+// - ScaleDownRequiredUnderutilizedNodeCount
+// - NodeCompactorEnabled
+
 package main
 
 import (
