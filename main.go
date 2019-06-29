@@ -2,11 +2,6 @@
 // - For deleting a node, I need a GCP service account, example in the preemptible killer
 // - Use node labels for opt-in and limits
 
-// Labels:
-// - ScaleDownCpuRequestPercentageLimit
-// - ScaleDownRequiredUnderutilizedNodeCount
-// - NodeCompactorEnabled
-
 package main
 
 import (
@@ -15,18 +10,55 @@ import (
 	"io/ioutil"
 	"log"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/ericchiang/k8s"
 	corev1 "github.com/ericchiang/k8s/apis/core/v1"
 	"github.com/ghodss/yaml"
 )
 
+// Labels:
+// - ScaleDownCpuRequestPercentageLimit
+// - ScaleDownRequiredUnderutilizedNodeCount
+// - NodeCompactorEnabled
+
+const labelNodeCompactorEnabled = "estafette.io/node-compactor-enabled"
+const labelNodeCompactorScaleDownCPURequestRatioLimit = "estafette.io/node-compactor-scale-down-cpu-request-ratio-limit"
+const labelNodeCompactorScaleDownRequiredUnderutilizedNodeCount = "estafette.io/node-compactor-scale-down-required-underutilized-node-count"
+const labelNodeCompactorScaleDownInProgress = "estafette.io/node-compactor-scale-down-in-progress"
+
+type nodeLabels struct {
+	// Shows whether the node compactor is enabled for the node.
+	enabled bool
+	// Sets the percentage if under which the CPU utilization falls, the node gets deleted.
+	scaleDownCPURequestRatioLimit float64
+	// The number of nodes which need to be underutilized in order to do the compaction.
+	// (If there is only one underutilized node, we shouldn't delete it, because its pods could not be moved anywhere else.)
+	scaleDownRequiredUnderutilizedNodeCount int
+	// It shows if scaling down is already in progress for this node.
+	scaleDownInProgress bool
+}
+
+type nodeStats struct {
+	allocatableCPU      int
+	allocatableMemoryMB int
+	totalCPURequests    int
+	totalMemoryRequests int
+	utilizedCPURatio    float64
+	utilizedMemoryRatio float64
+}
+
+type nodeInfo struct {
+	node   *corev1.Node
+	labels nodeLabels
+	stats  nodeStats
+}
+
 // For every node, we check
 // 1. Total use of allocated resources is below limit
 // 2. There are enough other nodes also under the limit
 // 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
-
-const annotationDesiredMinCpuUsage = "estafette.io/compactor-desired-min-cpu-usage"
 
 func main() {
 	// client, err := k8s.NewInClusterClient()
@@ -36,15 +68,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// var pod corev1.Pod
-	// if err = client.Get(context.Background(), "staging", "shoppingcart-cb7c89fbf-qxdz9", &pod); err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// if err := client.Create(context.Background(), &pod, k8s.Subresource("eviction")); err != nil {
-	// 	log.Fatal(err)
-	// }
 
 	// return
 	var nodes corev1.NodeList
@@ -75,48 +98,152 @@ func main() {
 	// 2. There are enough other nodes also under the limit
 	// 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
 
-	for _, node := range nodes.Items {
-		var pods []*corev1.Pod
-		for _, pod := range allPods.Items {
-			if *pod.Spec.NodeName == *node.Metadata.Name {
-				pods = append(pods, pod)
+	nodesByPool := groupNodesByPool(nodes.Items)
+
+	for pool, nodes := range nodesByPool {
+		fmt.Printf("Node pool: %s\n", pool)
+
+		nodeInfos := collectNodeInfos(nodes, allPods.Items)
+
+		nodeCountUnderLimit := 0
+		nodeCountScaleDownInProgress := 0
+		for _, nodeInfo := range nodeInfos {
+			nodeLabels := nodeInfo.labels
+			// nodeStats := nodeInfo.stats
+
+			// fmt.Printf("Node %v\n", *nodeInfo.node.Metadata.Name)
+			// fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", nodeStats.allocatableCPU, nodeStats.allocatableMemoryMB)
+			// fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", nodeStats.totalCPURequests, nodeStats.totalMemoryRequests)
+			// fmt.Printf("CPU utilization: %v%%, memory utilization: %v%%\n", nodeStats.utilizedCPURatio*100, nodeStats.utilizedMemoryRatio*100)
+			// fmt.Printf("\n")
+
+			if isNodeUnderutilizedCandidate(nodeInfo) {
+				nodeCountUnderLimit++
+			}
+
+			if nodeLabels.scaleDownInProgress {
+				nodeCountScaleDownInProgress++
 			}
 		}
 
-		// fmt.Printf("Node metadata %v\n", *node.Metadata)
-		fmt.Printf("Node pool: %v\n", node.Metadata.Labels["cloud.google.com/gke-nodepool"])
-		fmt.Printf("Node %v\n", *node.Metadata.Name)
-		allocatableCPU := cpuReqStrToCPU(*node.Status.Allocatable["cpu"].String_)
-		allocatableMemory := memoryReqStrToMemoryMB(*node.Status.Allocatable["memory"].String_)
-		fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", allocatableCPU, allocatableMemory)
-		// fmt.Printf("Node status: %v\n", node.Metadata)
+		// We check if there are enough underutilized pods so that we can initiate a scaledown.
+		// NOTE: We multiply by (nodeCountScaleDownInProgress + 1), because there might be nodes for which
+		// we have initiated the scaledown in previous iterations already, which haven't been removed yet,
+		// and we have to take these into account.
+		if nodeCountUnderLimit >= nodeInfos[0].labels.scaleDownRequiredUnderutilizedNodeCount*(nodeCountScaleDownInProgress+1) {
+			pick := pickUnderutilizedNodeToRemove(nodeInfos)
 
-		podsTotalCPUReq := 0
-		podsTotalMemoryReq := 0
-
-		for _, pod := range pods {
-			cpuReq := 0
-			memoryReq := 0
-			for _, container := range pod.Spec.Containers {
-				if container.Resources.Requests["cpu"] != nil {
-					cpuReqStr := *container.Resources.Requests["cpu"].String_
-					cpuReq += cpuReqStrToCPU(cpuReqStr)
-				}
-
-				if container.Resources.Requests["memory"] != nil {
-					memoryReqStr := *container.Resources.Requests["memory"].String_
-					memoryReq += memoryReqStrToMemoryMB(memoryReqStr)
-				}
+			if pick == nil {
+				fmt.Printf("No node was picked for removal.")
+			} else {
+				fmt.Printf("The node picked for removal:")
+				fmt.Printf("Node %v\n", *pick.node.Metadata.Name)
+				fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", pick.stats.allocatableCPU, pick.stats.allocatableMemoryMB)
+				fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", pick.stats.totalCPURequests, pick.stats.totalMemoryRequests)
+				fmt.Printf("CPU utilization: %v%%, memory utilization: %v%%\n", pick.stats.utilizedCPURatio*100, pick.stats.utilizedMemoryRatio*100)
 			}
-
-			podsTotalCPUReq += cpuReq
-			podsTotalMemoryReq += memoryReq
 		}
-
-		fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", podsTotalCPUReq, podsTotalMemoryReq)
-		fmt.Printf("CPU utilization: %v%%, memory utilization: %v%%\n", float64(podsTotalCPUReq)/float64(allocatableCPU)*100, float64(podsTotalMemoryReq)/float64(allocatableMemory)*100)
-		fmt.Printf("\n")
 	}
+}
+
+// Picks a node to be removed. We pick the node with the lowest utilization.
+func pickUnderutilizedNodeToRemove(nodes []nodeInfo) *nodeInfo {
+	var pick *nodeInfo
+
+	for _, n := range nodes {
+		if isNodeUnderutilizedCandidate(n) && (pick == nil || n.stats.utilizedCPURatio < pick.stats.utilizedCPURatio) {
+			pick = &n
+		}
+	}
+
+	return pick
+}
+
+// Returns if the node is a candidate for removing it for compacting the pool.
+// A node is considered a candidate if the following stands:
+// - It is underutilized
+// - Its scaledown is not in progress yet
+// - It's older than one hour (to prevent continuously deleting newly created nodes)
+func isNodeUnderutilizedCandidate(node nodeInfo) bool {
+	return node.labels.enabled &&
+		node.stats.utilizedCPURatio < node.labels.scaleDownCPURequestRatioLimit &&
+		!node.labels.scaleDownInProgress &&
+		*node.node.Metadata.CreationTimestamp.Seconds < time.Now().Unix()-3600
+}
+
+func collectNodeInfos(nodes []*corev1.Node, allPods []*corev1.Pod) []nodeInfo {
+	nodeInfos := make([]nodeInfo, 0)
+
+	for _, node := range nodes {
+		nodeInfos = append(
+			nodeInfos,
+			nodeInfo{
+				node:   node,
+				labels: readNodeLabels(node),
+				stats:  calculateNodeStats(node, allPods)})
+	}
+
+	return nodeInfos
+}
+
+func calculateNodeStats(node *corev1.Node, allPods []*corev1.Pod) nodeStats {
+	var podsOnNode []*corev1.Pod
+	for _, pod := range allPods {
+		if *pod.Spec.NodeName == *node.Metadata.Name {
+			podsOnNode = append(podsOnNode, pod)
+		}
+	}
+
+	allocatableCPU := cpuReqStrToCPU(*node.Status.Allocatable["cpu"].String_)
+	allocatableMemory := memoryReqStrToMemoryMB(*node.Status.Allocatable["memory"].String_)
+
+	podsTotalCPUReq := 0
+	podsTotalMemoryReq := 0
+
+	for _, pod := range podsOnNode {
+		cpuReq := 0
+		memoryReq := 0
+		for _, container := range pod.Spec.Containers {
+			if container.Resources.Requests["cpu"] != nil {
+				cpuReqStr := *container.Resources.Requests["cpu"].String_
+				cpuReq += cpuReqStrToCPU(cpuReqStr)
+			}
+
+			if container.Resources.Requests["memory"] != nil {
+				memoryReqStr := *container.Resources.Requests["memory"].String_
+				memoryReq += memoryReqStrToMemoryMB(memoryReqStr)
+			}
+		}
+
+		podsTotalCPUReq += cpuReq
+		podsTotalMemoryReq += memoryReq
+	}
+
+	return nodeStats{
+		allocatableCPU:      allocatableCPU,
+		allocatableMemoryMB: allocatableMemory,
+		totalCPURequests:    podsTotalCPUReq,
+		totalMemoryRequests: podsTotalMemoryReq,
+		utilizedCPURatio:    float64(podsTotalCPUReq) / float64(allocatableCPU),
+		utilizedMemoryRatio: float64(podsTotalMemoryReq) / float64(allocatableMemory),
+	}
+}
+
+func groupNodesByPool(nodes []*corev1.Node) map[string][]*corev1.Node {
+	grouped := make(map[string][]*corev1.Node)
+
+	for _, node := range nodes {
+		pool := node.Metadata.Labels["cloud.google.com/gke-nodepool"]
+		if ns, ok := grouped[pool]; ok {
+			grouped[pool] = append(ns, node)
+		} else {
+			ns := make([]*corev1.Node, 1)
+			ns[0] = node
+			grouped[pool] = ns
+		}
+	}
+
+	return grouped
 }
 
 func memoryReqStrToMemoryMB(str string) int {
@@ -145,6 +272,67 @@ func cpuReqStrToCPU(str string) int {
 	}
 }
 
+func readNodeLabels(node *corev1.Node) nodeLabels {
+	labels := nodeLabels{}
+
+	enabledStr, ok := node.Metadata.Labels[labelNodeCompactorEnabled]
+	if ok {
+		e, err := strconv.ParseBool(enabledStr)
+		if err == nil {
+			labels.enabled = e
+		} else {
+			labels.enabled = false
+		}
+	} else {
+		labels.enabled = false
+	}
+
+	if strings.HasPrefix(*node.Metadata.Name, "gke-production-europ-rulesapi-14-2662") {
+		labels.enabled = true
+	}
+
+	ratioLimitStr, ok := node.Metadata.Labels[labelNodeCompactorScaleDownCPURequestRatioLimit]
+	if ok {
+		l, err := strconv.ParseFloat(ratioLimitStr, 64)
+		if err == nil {
+			labels.scaleDownCPURequestRatioLimit = l
+		} else {
+			labels.scaleDownCPURequestRatioLimit = 0
+		}
+	} else {
+		labels.scaleDownCPURequestRatioLimit = 0
+	}
+
+	nodeCountStr, ok := node.Metadata.Labels[labelNodeCompactorScaleDownRequiredUnderutilizedNodeCount]
+	if ok {
+		c, err := strconv.ParseInt(nodeCountStr, 10, 0)
+		if err == nil {
+			labels.scaleDownRequiredUnderutilizedNodeCount = int(c)
+		} else {
+			labels.scaleDownRequiredUnderutilizedNodeCount = 0
+		}
+	} else {
+		labels.scaleDownRequiredUnderutilizedNodeCount = 0
+	}
+
+	scaleDownInProgressStr, ok := node.Metadata.Labels[labelNodeCompactorScaleDownInProgress]
+	if ok {
+		i, err := strconv.ParseBool(scaleDownInProgressStr)
+		if err == nil {
+			labels.scaleDownInProgress = i
+		} else {
+			labels.scaleDownInProgress = false
+		}
+	} else {
+		labels.scaleDownInProgress = false
+	}
+
+	labels.scaleDownCPURequestRatioLimit = 0.75
+	labels.scaleDownRequiredUnderutilizedNodeCount = 4
+
+	return labels
+}
+
 // loadClient parses a kubeconfig from a file and returns a Kubernetes client. It does not support extensions or client auth providers.
 func loadClient(kubeconfigPath string) (*k8s.Client, error) {
 	data, err := ioutil.ReadFile(kubeconfigPath)
@@ -159,23 +347,3 @@ func loadClient(kubeconfigPath string) (*k8s.Client, error) {
 	}
 	return k8s.NewClient(&config)
 }
-
-// for _, node := range nodes.Items {
-// node := nodes.Items[0]
-// fmt.Printf("name=%q schedulable=%t\n", *node.Metadata.Name, !*node.Spec.Unschedulable)
-// fmt.Printf("capacity=%v\n", node.Status.Capacity)
-// fmt.Printf("allocatable=%v\n", node.Status.Allocatable)
-// fmt.Printf("phase=%v\n", *node.Status.Phase)
-// fmt.Printf("conditions=%v\n", node.Status.Conditions)
-// for _, container := range node.Status.Images {
-// 	fmt.Printf("%v\n", container)
-// }
-// }
-
-// pod := pods.Items[0]
-// fmt.Printf("name: %v\n", *pod.Metadata.Name)
-// fmt.Printf("namespace: %v\n", *pod.Metadata.Namespace)
-// fmt.Printf("node: %v\n", *pod.Spec.NodeName)
-// fmt.Printf("resource limits: %v, resource requests: %v\n", pod.Spec.Containers[0].Resources.Limits, pod.Spec.Containers[0].Resources.Requests)
-// fmt.Printf("resource limits: %v, resource requests: %v\n", pod.Spec.Containers[1].Resources.Limits, pod.Spec.Containers[1].Resources.Requests)
-// fmt.Printf("resource limits: %v, resource requests: %v\n", pod.Spec.Containers[2].Resources.Limits, pod.Spec.Containers[2].Resources.Requests)
