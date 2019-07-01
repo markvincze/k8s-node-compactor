@@ -1,7 +1,11 @@
-// - Don't delete young node
-// - For deleting a node, I need a GCP service account, example in the preemptible killer
-// - Use node labels for opt-in and limits
-
+// TODO:
+// - RBAC
+// - Prometheus
+// - Proper logging
+// - kubernetes.yaml
+// - Dockerfile
+// - estafette.yaml
+// - README
 package main
 
 import (
@@ -17,11 +21,6 @@ import (
 	corev1 "github.com/ericchiang/k8s/apis/core/v1"
 	"github.com/ghodss/yaml"
 )
-
-// Labels:
-// - ScaleDownCpuRequestPercentageLimit
-// - ScaleDownRequiredUnderutilizedNodeCount
-// - NodeCompactorEnabled
 
 const labelNodeCompactorEnabled = "estafette.io/node-compactor-enabled"
 const labelNodeCompactorScaleDownCPURequestRatioLimit = "estafette.io/node-compactor-scale-down-cpu-request-ratio-limit"
@@ -53,12 +52,8 @@ type nodeInfo struct {
 	node   *corev1.Node
 	labels nodeLabels
 	stats  nodeStats
+	pods   []*corev1.Pod
 }
-
-// For every node, we check
-// 1. Total use of allocated resources is below limit
-// 2. There are enough other nodes also under the limit
-// 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
 
 func main() {
 	// client, err := k8s.NewInClusterClient()
@@ -69,7 +64,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// return
 	var nodes corev1.NodeList
 	if err := client.List(context.Background(), k8s.AllNamespaces, &nodes); err != nil {
 		log.Fatal(err)
@@ -81,23 +75,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// var foundPod *corev1.Pod
-	// for _, pod := range allPods.Items {
-	// 	if *pod.Metadata.Name == "shoppingcart-589868587-xbgpv" {
-	// 		foundPod = pod
-	// 	}
-	// }
-
-	// // client.Create(context.Background(), foundPod)
-	// client.Delete(context.Background(), foundPod)
-
-	// return
-
-	// For every node, we check
-	// 1. Total use of allocated resources is below limit
-	// 2. There are enough other nodes also under the limit
-	// 3. With evicting the pods on this node we wouldn't remove 50% of any deployment
-
 	nodesByPool := groupNodesByPool(nodes.Items)
 
 	for pool, nodes := range nodesByPool {
@@ -107,15 +84,10 @@ func main() {
 
 		nodeCountUnderLimit := 0
 		nodeCountScaleDownInProgress := 0
+
+		// For every node pool we check if there are enough nodes using less resources than the limit for scaledown.
 		for _, nodeInfo := range nodeInfos {
 			nodeLabels := nodeInfo.labels
-			// nodeStats := nodeInfo.stats
-
-			// fmt.Printf("Node %v\n", *nodeInfo.node.Metadata.Name)
-			// fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", nodeStats.allocatableCPU, nodeStats.allocatableMemoryMB)
-			// fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", nodeStats.totalCPURequests, nodeStats.totalMemoryRequests)
-			// fmt.Printf("CPU utilization: %v%%, memory utilization: %v%%\n", nodeStats.utilizedCPURatio*100, nodeStats.utilizedMemoryRatio*100)
-			// fmt.Printf("\n")
 
 			if isNodeUnderutilizedCandidate(nodeInfo) {
 				nodeCountUnderLimit++
@@ -141,9 +113,35 @@ func main() {
 				fmt.Printf("Allocatable CPU: %vm, memory: %vMi\n", pick.stats.allocatableCPU, pick.stats.allocatableMemoryMB)
 				fmt.Printf("Pods on node total requests, CPU: %vm, memory: %vMi\n", pick.stats.totalCPURequests, pick.stats.totalMemoryRequests)
 				fmt.Printf("CPU utilization: %v%%, memory utilization: %v%%\n", pick.stats.utilizedCPURatio*100, pick.stats.utilizedMemoryRatio*100)
+
+				fmt.Printf("Cordoning the node...")
+				cordonNode(pick.node, client)
+
+				fmt.Printf("Drain the pods...")
+				drainPods(pick, client)
 			}
 		}
 	}
+}
+
+func cordonNode(node *corev1.Node, k8sClient *k8s.Client) error {
+	*node.Spec.Unschedulable = true
+
+	err := k8sClient.Update(context.Background(), node)
+
+	return err
+}
+
+func drainPods(node *nodeInfo, k8sClient *k8s.Client) error {
+	for _, pod := range node.pods {
+		err := k8sClient.Delete(context.Background(), pod)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Picks a node to be removed. We pick the node with the lowest utilization.
@@ -175,18 +173,20 @@ func collectNodeInfos(nodes []*corev1.Node, allPods []*corev1.Pod) []nodeInfo {
 	nodeInfos := make([]nodeInfo, 0)
 
 	for _, node := range nodes {
+		podsOnNode := getPodsOnNode(node, allPods)
 		nodeInfos = append(
 			nodeInfos,
 			nodeInfo{
 				node:   node,
 				labels: readNodeLabels(node),
-				stats:  calculateNodeStats(node, allPods)})
+				stats:  calculateNodeStats(node, podsOnNode),
+				pods:   podsOnNode})
 	}
 
 	return nodeInfos
 }
 
-func calculateNodeStats(node *corev1.Node, allPods []*corev1.Pod) nodeStats {
+func getPodsOnNode(node *corev1.Node, allPods []*corev1.Pod) []*corev1.Pod {
 	var podsOnNode []*corev1.Pod
 	for _, pod := range allPods {
 		if *pod.Spec.NodeName == *node.Metadata.Name {
@@ -194,6 +194,10 @@ func calculateNodeStats(node *corev1.Node, allPods []*corev1.Pod) nodeStats {
 		}
 	}
 
+	return podsOnNode
+}
+
+func calculateNodeStats(node *corev1.Node, podsOnNode []*corev1.Pod) nodeStats {
 	allocatableCPU := cpuReqStrToCPU(*node.Status.Allocatable["cpu"].String_)
 	allocatableMemory := memoryReqStrToMemoryMB(*node.Status.Allocatable["memory"].String_)
 
